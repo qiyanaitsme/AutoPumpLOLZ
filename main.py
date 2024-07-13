@@ -153,7 +153,7 @@ async def process_list_callback(callback_query: CallbackQuery):
             thread_title = await asyncio.to_thread(get_thread_title, thread_id)
             thread_link = f"{thread_id} - {thread_title} (<a href='https://zelenka.guru/threads/{thread_id}'>Перейти</a>)"
             thread_info.append(thread_link)
-            await asyncio.sleep(3)  # Интервал в 3 секунды между запросами
+            await asyncio.sleep(3)
         await bot.send_message(callback_query.from_user.id, "Список тем:\n" + "\n".join(thread_info),
                                parse_mode=ParseMode.HTML)
     else:
