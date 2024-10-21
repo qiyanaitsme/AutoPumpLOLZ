@@ -1,172 +1,133 @@
 import logging
 import asyncio
-import requests
-import sqlite3
+import aiohttp
+import aiosqlite
+import json
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.middlewares.logging import LoggingMiddleware
 from aiogram.types import ParseMode, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.utils import executor
 import re
+from typing import List, Tuple, Optional
+from dataclasses import dataclass
 
-API_TOKEN = ''
-IMG_URL = 'https://wallpapers-clan.com/wp-content/uploads/2024/04/dark-anime-girl-with-red-eyes-desktop-wallpaper-preview.jpg'
-AUTH_TOKEN = ''
-AUTHOR_URL = 'https://lolz.live/qiyanalol/'
+with open('config.json', 'r', encoding='utf-8') as config_file:
+    CONFIG = json.load(config_file)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-bot = Bot(token=API_TOKEN)
+bot = Bot(token=CONFIG['bot']['api_token'])
 dp = Dispatcher(bot)
 dp.middleware.setup(LoggingMiddleware())
 
-conn = sqlite3.connect('threads.db')
-cursor = conn.cursor()
-cursor.execute('''CREATE TABLE IF NOT EXISTS threads (id INTEGER PRIMARY KEY, thread_id TEXT UNIQUE)''')
-conn.commit()
+@dataclass
+class Thread:
+    id: int
+    title: str
 
+class DatabaseManager:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
 
-def bump_thread(thread_id):
-    url = f"https://api.zelenka.guru/threads/{thread_id}/bump"
-    headers = {
-        "accept": "application/json",
-        "authorization": f"Bearer {AUTH_TOKEN}"
-    }
-    response = requests.post(url, headers=headers)
-    response_data = response.json()
-    logger.info(f"Response for thread {thread_id}: {response_data}")
-    if response.status_code == 200:
+    async def init(self):
+        self.conn = await aiosqlite.connect(self.db_path)
+        await self.conn.execute('''CREATE TABLE IF NOT EXISTS threads 
+                                   (id INTEGER PRIMARY KEY, thread_id TEXT UNIQUE)''')
+        await self.conn.commit()
+
+    async def close(self):
+        await self.conn.close()
+
+    async def add_thread(self, thread_id: str) -> bool:
         try:
-            error_message = response_data["errors"][0]
-            time_match = re.search(r'(\d+)\s+часов\s+(\d+)\s+минут\s+(\d+)\s+секунд', error_message)
-            if time_match:
-                hours, minutes, seconds = map(int, time_match.groups())
-                return (
-                    None,
-                    f"Согласно вашим правам вы можете поднимать тему раз в 12 часов. Вы должны подождать {hours} часов, {minutes} минут, {seconds} секунд, чтобы поднять тему {thread_id}."
-                )
-            else:
-                return (
-                    None,
-                    f"Ошибка для темы {thread_id}: {error_message}"
-                )
-        except (IndexError, KeyError):
-            return (
-                None,
-                f"Вы подняли тему {thread_id}."
-            )
-    else:
-        return (
-            None,
-            f"Ошибка при поднятии темы {thread_id}: {response.status_code}"
-        )
+            await self.conn.execute("INSERT INTO threads (thread_id) VALUES (?)", (thread_id,))
+            await self.conn.commit()
+            return True
+        except aiosqlite.IntegrityError:
+            return False
 
+    async def delete_thread(self, thread_id: str):
+        await self.conn.execute("DELETE FROM threads WHERE thread_id = ?", (thread_id,))
+        await self.conn.commit()
 
-def get_all_threads():
-    cursor.execute("SELECT thread_id FROM threads")
-    return cursor.fetchall()
+    async def get_all_threads(self) -> List[str]:
+        async with self.conn.execute("SELECT thread_id FROM threads") as cursor:
+            return [row[0] for row in await cursor.fetchall()]
 
+class APIClient:
+    def __init__(self, base_url: str, auth_token: str):
+        self.base_url = base_url
+        self.headers = {
+            "accept": "application/json",
+            "authorization": f"Bearer {auth_token}"
+        }
 
-def add_thread_to_db(thread_id):
-    try:
-        cursor.execute("INSERT INTO threads (thread_id) VALUES (?)", (thread_id,))
-        conn.commit()
-        return True
-    except sqlite3.IntegrityError:
-        return False
+    async def bump_thread(self, thread_id: str) -> Tuple[Optional[str], str]:
+        url = f"{self.base_url}/threads/{thread_id}/bump"
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=self.headers) as response:
+                response_data = await response.json()
+                logger.info(f"Response for thread {thread_id}: {response_data}")
+                if response.status == 200:
+                    try:
+                        error_message = response_data["errors"][0]
+                        time_match = re.search(r'(\d+)\s+часов\s+(\d+)\s+минут\s+(\d+)\s+секунд', error_message)
+                        if time_match:
+                            hours, minutes, seconds = map(int, time_match.groups())
+                            return (None, f"Согласно вашим правам вы можете поднимать тему раз в 12 часов. "
+                                          f"Вы должны подождать {hours} часов, {minutes} минут, {seconds} секунд, "
+                                          f"чтобы поднять тему {thread_id}.")
+                        else:
+                            return (None, f"Ошибка для темы {thread_id}: {error_message}")
+                    except (IndexError, KeyError):
+                        return (None, f"Вы подняли тему {thread_id}.")
+                else:
+                    return (None, f"Ошибка при поднятии темы {thread_id}: {response.status}")
 
+    async def get_thread_title(self, thread_id: str) -> str:
+        url = f"{self.base_url}/threads/{thread_id}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=self.headers) as response:
+                if response.status == 200:
+                    thread_data = await response.json()
+                    return thread_data["thread"]["thread_title"]
+                return "Unknown Title"
 
-def delete_thread_from_db(thread_id):
-    cursor.execute("DELETE FROM threads WHERE thread_id = ?", (thread_id,))
-    conn.commit()
+class BumpBot:
+    def __init__(self, db_manager: DatabaseManager, api_client: APIClient):
+        self.db_manager = db_manager
+        self.api_client = api_client
 
-
-def get_thread_title(thread_id):
-    url = f"https://api.zelenka.guru/threads/{thread_id}"
-    headers = {
-        "accept": "application/json",
-        "authorization": f"Bearer {AUTH_TOKEN}"
-    }
-    response = requests.get(url, headers=headers)
-    if response.status_code == 200:
-        thread_data = response.json()
-        return thread_data["thread"]["thread_title"]
-    return "Unknown Title"
-
-
-@dp.callback_query_handler(lambda c: c.data == 'add_thread')
-async def process_add_callback(callback_query: CallbackQuery):
-    await bot.answer_callback_query(callback_query.id)
-    await bot.send_message(callback_query.from_user.id, "Введите ID тем через запятую для добавления:")
-
-
-@dp.message_handler(lambda message: ',' in message.text)
-async def add_threads(message: types.Message):
-    thread_ids = message.text.split(',')
-    added_threads = []
-    for thread_id in thread_ids:
-        thread_id = thread_id.strip()
-        if thread_id.isdigit():
-            if add_thread_to_db(thread_id):
+    async def add_threads(self, thread_ids: List[str]) -> List[str]:
+        added_threads = []
+        for thread_id in thread_ids:
+            if thread_id.isdigit() and await self.db_manager.add_thread(thread_id):
                 added_threads.append(thread_id)
-            else:
-                await message.reply(f"Тема с ID {thread_id} уже есть в списке.")
-    if added_threads:
-        await message.reply(f"Добавлены темы с ID: {', '.join(added_threads)}")
-    else:
-        await message.reply("Не удалось добавить темы. Убедитесь, что вы ввели корректные ID через запятую.")
-    await send_welcome(message)
+        return added_threads
 
+    async def delete_thread(self, thread_id: str):
+        await self.db_manager.delete_thread(thread_id)
 
-@dp.callback_query_handler(lambda c: c.data == 'delete_thread')
-async def process_delete_callback(callback_query: CallbackQuery):
-    await bot.answer_callback_query(callback_query.id)
-    threads = get_all_threads()
-    if not threads:
-        await bot.send_message(callback_query.from_user.id, "Список тем пуст.")
-        return
-    keyboard = InlineKeyboardMarkup()
-    for thread in threads:
-        keyboard.add(InlineKeyboardButton(thread[0], callback_data=f'delete_{thread[0]}'))
-    await bot.send_message(callback_query.from_user.id, "Выберите тему для удаления:", reply_markup=keyboard)
-
-
-@dp.callback_query_handler(lambda c: c.data.startswith('delete_'))
-async def process_delete_thread_callback(callback_query: CallbackQuery):
-    thread_id = callback_query.data.split('_')[1]
-    delete_thread_from_db(thread_id)
-    await bot.answer_callback_query(callback_query.id, text=f"Тема {thread_id} удалена.")
-    threads = get_all_threads()
-    if threads:
-        await process_delete_callback(callback_query)
-    else:
-        await send_welcome(callback_query.message)
-
-
-@dp.callback_query_handler(lambda c: c.data == 'list_threads')
-async def process_list_callback(callback_query: CallbackQuery):
-    threads = get_all_threads()
-    if threads:
-        thread_info = []
-        for thread in threads:
-            thread_id = thread[0]
-            thread_title = await asyncio.to_thread(get_thread_title, thread_id)
-            thread_link = f"{thread_id} - {thread_title} (<a href='https://zelenka.guru/threads/{thread_id}'>Перейти</a>)"
-            thread_info.append(thread_link)
+    async def list_threads(self) -> List[Thread]:
+        threads = []
+        for thread_id in await self.db_manager.get_all_threads():
+            title = await self.api_client.get_thread_title(thread_id)
+            threads.append(Thread(id=thread_id, title=title))
             await asyncio.sleep(3)
-        await bot.send_message(callback_query.from_user.id, "Список тем:\n" + "\n".join(thread_info),
-                               parse_mode=ParseMode.HTML)
-    else:
-        await bot.send_message(callback_query.from_user.id, "Список тем пуст.")
-    await send_welcome(callback_query.message)
+        return threads
 
+    async def bump_all_threads(self) -> List[str]:
+        messages = []
+        for thread_id in await self.db_manager.get_all_threads():
+            _, message = await self.api_client.bump_thread(thread_id)
+            messages.append(message)
+            await asyncio.sleep(5)
+        return messages
 
-@dp.callback_query_handler(lambda c: c.data == 'bump_threads')
-async def process_bump_callback(callback_query: CallbackQuery):
-    await bot.answer_callback_query(callback_query.id)
-    await bump_all_threads(callback_query.from_user.id)
-    await send_welcome(callback_query.message)
-
+db_manager = DatabaseManager(CONFIG['database']['path'])
+api_client = APIClient(CONFIG['api']['base_url'], CONFIG['api']['auth_token'])
+bump_bot = BumpBot(db_manager, api_client)
 
 @dp.message_handler(commands=['start', 'help'])
 async def send_welcome(message: types.Message):
@@ -175,34 +136,81 @@ async def send_welcome(message: types.Message):
         InlineKeyboardButton("Добавить тему", callback_data='add_thread'),
         InlineKeyboardButton("Удалить тему", callback_data='delete_thread'),
         InlineKeyboardButton("Поднять темы", callback_data='bump_threads'),
-        InlineKeyboardButton("Автор", url=AUTHOR_URL)
+        InlineKeyboardButton("Автор", url=CONFIG['bot']['author_url'])
     )
-    await message.reply_photo(IMG_URL, caption="Привет! Я бот для поднятия тем. Выбери действие:",
-                              reply_markup=keyboard)
+    await message.reply_photo(CONFIG['bot']['img_url'],
+                            caption="Привет! Я бот для поднятия тем. Выбери действие:",
+                            reply_markup=keyboard)
 
+@dp.callback_query_handler(lambda c: c.data == 'add_thread')
+async def process_add_callback(callback_query: CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)
+    await bot.send_message(callback_query.from_user.id, "Введите ID тем через запятую для добавления:")
+
+@dp.message_handler(lambda message: ',' in message.text)
+async def add_threads(message: types.Message):
+    thread_ids = [tid.strip() for tid in message.text.split(',')]
+    added_threads = await bump_bot.add_threads(thread_ids)
+    if added_threads:
+        await message.reply(f"Добавлены темы с ID: {', '.join(added_threads)}")
+    else:
+        await message.reply("Не удалось добавить темы. Убедитесь, что вы ввели корректные ID через запятую.")
+    await send_welcome(message)
+
+@dp.callback_query_handler(lambda c: c.data == 'delete_thread')
+async def process_delete_callback(callback_query: CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)
+    threads = await bump_bot.list_threads()
+    if not threads:
+        await bot.send_message(callback_query.from_user.id, "Список тем пуст.")
+        return
+    keyboard = InlineKeyboardMarkup()
+    for thread in threads:
+        keyboard.add(InlineKeyboardButton(f"{thread.id} - {thread.title}", callback_data=f'delete_{thread.id}'))
+    await bot.send_message(callback_query.from_user.id, "Выберите тему для удаления:", reply_markup=keyboard)
+
+@dp.callback_query_handler(lambda c: c.data.startswith('delete_'))
+async def process_delete_thread_callback(callback_query: CallbackQuery):
+    thread_id = callback_query.data.split('_')[1]
+    await bump_bot.delete_thread(thread_id)
+    await bot.answer_callback_query(callback_query.id, text=f"Тема {thread_id} удалена.")
+    threads = await bump_bot.list_threads()
+    if threads:
+        await process_delete_callback(callback_query)
+    else:
+        await send_welcome(callback_query.message)
+
+@dp.callback_query_handler(lambda c: c.data == 'list_threads')
+async def process_list_callback(callback_query: CallbackQuery):
+    threads = await bump_bot.list_threads()
+    if threads:
+        thread_info = [f"{thread.id} - {thread.title} (<a href='https://zelenka.guru/threads/{thread.id}'>Перейти</a>)"
+                       for thread in threads]
+        await bot.send_message(callback_query.from_user.id, "Список тем:\n" + "\n".join(thread_info),
+                               parse_mode=ParseMode.HTML)
+    else:
+        await bot.send_message(callback_query.from_user.id, "Список тем пуст.")
+    await send_welcome(callback_query.message)
+
+@dp.callback_query_handler(lambda c: c.data == 'bump_threads')
+async def process_bump_callback(callback_query: CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)
+    messages = await bump_bot.bump_all_threads()
+    for message in messages:
+        await bot.send_message(callback_query.from_user.id, message)
+    await send_welcome(callback_query.message)
 
 async def scheduled_bump():
     while True:
-        await asyncio.sleep(12 * 3600)
-        await bump_all_threads()
+        await asyncio.sleep(CONFIG['scheduling']['bump_interval_hours'] * 3600)
+        await bump_bot.bump_all_threads()
 
+async def on_startup(dp):
+    await db_manager.init()
+    asyncio.create_task(scheduled_bump())
 
-async def bump_all_threads(user_id=None):
-    threads = get_all_threads()
-    if not threads:
-        if user_id:
-            await bot.send_message(user_id, "Список тем пуст.")
-        return
-
-    for thread in threads:
-        thread_id = thread[0]
-        result = bump_thread(thread_id)
-        if user_id:
-            await bot.send_message(user_id, result[1])
-        await asyncio.sleep(5)
-
+async def on_shutdown(dp):
+    await db_manager.close()
 
 if __name__ == '__main__':
-    loop = asyncio.get_event_loop()
-    loop.create_task(scheduled_bump())
-    executor.start_polling(dp, skip_updates=True)
+    executor.start_polling(dp, on_startup=on_startup, on_shutdown=on_shutdown, skip_updates=True)
